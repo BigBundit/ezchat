@@ -36,14 +36,33 @@ const clients = new Map<WebSocket, User>();
 // Broadcast user list to all connected clients
 const broadcastUserList = async () => {
   try {
-    const result = await db.execute('SELECT id, username, status, avatar, personal_message as personalMessage FROM users WHERE status != "offline"');
-    const userList = result.rows.map(row => ({
+    // Get users from database (persistent users)
+    const result = await db.execute('SELECT id, username, status, avatar, personal_message as personalMessage FROM users');
+    const dbUsers = result.rows.map(row => ({
       id: row.id as string,
       username: row.username as string,
       status: row.status as string,
       avatar: row.avatar as string | undefined,
       personalMessage: row.personalMessage as string | undefined,
     }));
+
+    // Get currently connected users from memory
+    const connectedUsers = Array.from(clients.values());
+
+    // Merge users: prefer connected users' status over database status
+    const userMap = new Map<string, User>();
+
+    // Add database users first
+    dbUsers.forEach(user => userMap.set(user.id, {
+      ...user,
+      status: user.status as User['status'] // Type assertion for status
+    }));
+
+    // Override with connected users (they have the most current status)
+    connectedUsers.forEach(user => userMap.set(user.id, user));
+
+    // Convert to array and filter out offline users
+    const userList = Array.from(userMap.values()).filter(user => user.status !== 'offline');
 
     const message = JSON.stringify({
       type: 'USER_LIST',
