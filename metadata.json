@@ -1,0 +1,5 @@
+{
+  "name": "Remix: Real-Time Chat",
+  "description": "A real-time chat application using WebSockets for instant messaging between users.",
+  "requestFramePermissions": []
+}
