@@ -19,8 +19,10 @@ export default function App() {
 
   // Initialize WebSocket
   useEffect(() => {
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}`;
+    const wsUrl = import.meta.env.VITE_WS_URL || (() => {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${protocol}//${window.location.host}`;
+    })();
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
