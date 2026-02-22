@@ -19,11 +19,12 @@ export default function App() {
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // API Base URL
-  const API_BASE = import.meta.env.VITE_API_URL || '';
+  const API_BASE = import.meta.env.VITE_API_URL || 'https://ezchat-jdm6.onrender.com';
 
   // API Functions
   const apiRequest = async (endpoint: string, options: RequestInit = {}) => {
     const url = `${API_BASE}${endpoint}`;
+    console.log('API Request:', url); // Debug log
     const response = await fetch(url, {
       headers: {
         'Content-Type': 'application/json',
