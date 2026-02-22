@@ -3,6 +3,11 @@ import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer } from 'vite';
 import { randomUUID } from 'crypto';
+import { createClient } from '@libsql/client';
+import dotenv from 'dotenv';
+
+// Load environment variables
+dotenv.config();
 
 // Define types locally since we can't import from src/types.ts in server.ts easily without build step
 interface User {
@@ -19,28 +24,46 @@ const wss = new WebSocketServer({ server });
 
 const PORT = 3000;
 
+// Initialize Turso database client
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL || 'file:local.db',
+  authToken: process.env.TURSO_AUTH_TOKEN,
+});
+
 // Store connected clients: Map<WebSocket, User>
 const clients = new Map<WebSocket, User>();
 
 // Broadcast user list to all connected clients
-const broadcastUserList = () => {
-  const userList = Array.from(clients.values());
-  const message = JSON.stringify({
-    type: 'USER_LIST',
-    payload: userList,
-  });
+const broadcastUserList = async () => {
+  try {
+    const result = await db.execute('SELECT id, username, status, avatar, personal_message as personalMessage FROM users WHERE status != "offline"');
+    const userList = result.rows.map(row => ({
+      id: row.id as string,
+      username: row.username as string,
+      status: row.status as string,
+      avatar: row.avatar as string | undefined,
+      personalMessage: row.personalMessage as string | undefined,
+    }));
 
-  clients.forEach((_, ws) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(message);
-    }
-  });
+    const message = JSON.stringify({
+      type: 'USER_LIST',
+      payload: userList,
+    });
+
+    clients.forEach((_, ws) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(message);
+      }
+    });
+  } catch (error) {
+    console.error('Failed to fetch user list from database:', error);
+  }
 };
 
 wss.on('connection', (ws) => {
   console.log('Client connected');
 
-  ws.on('message', (message) => {
+  ws.on('message', async (message) => {
     try {
       const data = JSON.parse(message.toString());
       
@@ -55,6 +78,23 @@ wss.on('connection', (ws) => {
             personalMessage
           };
           
+          try {
+            // Insert or update user in database
+            await db.execute({
+              sql: `
+                INSERT INTO users (id, username, status, avatar, personal_message)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (username) DO UPDATE SET
+                  status = excluded.status,
+                  avatar = excluded.avatar,
+                  personal_message = excluded.personal_message
+              `,
+              args: [user.id, user.username, user.status, user.avatar || null, user.personalMessage || null]
+            });
+          } catch (error) {
+            console.error('Failed to save user to database:', error);
+          }
+          
           clients.set(ws, user);
           
           // Send back the created user object to the client so they know their ID
@@ -63,7 +103,7 @@ wss.on('connection', (ws) => {
             payload: user
           }));
 
-          broadcastUserList();
+          await broadcastUserList();
           break;
         }
 
@@ -73,8 +113,18 @@ wss.on('connection', (ws) => {
             const { status, personalMessage } = data.payload;
             if (status) user.status = status;
             if (personalMessage !== undefined) user.personalMessage = personalMessage;
+            
+            try {
+              await db.execute({
+                sql: 'UPDATE users SET status = ?, personal_message = ? WHERE id = ?',
+                args: [user.status, user.personalMessage || null, user.id]
+              });
+            } catch (error) {
+              console.error('Failed to update user status in database:', error);
+            }
+            
             clients.set(ws, user);
-            broadcastUserList();
+            await broadcastUserList();
           }
           break;
         }
@@ -91,6 +141,16 @@ wss.on('connection', (ws) => {
               timestamp: Date.now(),
               type: type || 'text'
             };
+
+            try {
+              // Save message to database
+              await db.execute({
+                sql: 'INSERT INTO messages (id, sender_id, target_id, text, type, timestamp) VALUES (?, ?, ?, ?, ?, ?)',
+                args: [msgPayload.id, msgPayload.senderId, msgPayload.targetId, msgPayload.text, msgPayload.type, msgPayload.timestamp]
+              });
+            } catch (error) {
+              console.error('Failed to save message to database:', error);
+            }
 
             // Find target socket
             let targetWs: WebSocket | undefined;
@@ -145,16 +205,57 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', async () => {
     if (clients.has(ws)) {
+      const user = clients.get(ws)!;
+      try {
+        await db.execute({
+          sql: 'UPDATE users SET status = ? WHERE id = ?',
+          args: ['offline', user.id]
+        });
+      } catch (error) {
+        console.error('Failed to update user status to offline:', error);
+      }
+      
       clients.delete(ws);
-      broadcastUserList();
+      await broadcastUserList();
       console.log('Client disconnected');
     }
   });
 });
 
 async function startServer() {
+  // Initialize database tables
+  try {
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        status TEXT DEFAULT 'offline',
+        avatar TEXT,
+        personal_message TEXT,
+        created_at INTEGER DEFAULT (unixepoch())
+      )
+    `);
+
+    await db.execute(`
+      CREATE TABLE IF NOT EXISTS messages (
+        id TEXT PRIMARY KEY,
+        sender_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        type TEXT DEFAULT 'text',
+        timestamp INTEGER NOT NULL,
+        FOREIGN KEY (sender_id) REFERENCES users (id),
+        FOREIGN KEY (target_id) REFERENCES users (id)
+      )
+    `);
+
+    console.log('Database initialized successfully');
+  } catch (error) {
+    console.error('Failed to initialize database:', error);
+  }
+
   // Vite middleware for development
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
