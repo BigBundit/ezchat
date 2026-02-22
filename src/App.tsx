@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { User, UserStatus, Message, WSMessage } from './types';
+import { User, UserStatus, Message } from './types';
 import MSNLogin from './components/MSNLogin';
 import ContactList from './components/ContactList';
 import ChatWindow from './components/ChatWindow';
@@ -15,214 +15,148 @@ export default function App() {
   const [users, setUsers] = useState<User[]>([]);
   const [conversations, setConversations] = useState<Record<string, Message[]>>({});
   const [activeWindows, setActiveWindows] = useState<string[]>([]);
-  const wsRef = useRef<WebSocket | null>(null);
+  const [lastMessageTimestamp, setLastMessageTimestamp] = useState<number>(0);
+  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Initialize WebSocket
-  useEffect(() => {
-    const wsUrl = import.meta.env.VITE_WS_URL || (() => {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      return `${protocol}//${window.location.host}`;
-    })();
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+  // API Base URL
+  const API_BASE = import.meta.env.VITE_API_URL || '';
 
-    ws.onopen = () => {
-      console.log('Connected to WebSocket');
-    };
+  // API Functions
+  const apiRequest = async (endpoint: string, options: RequestInit = {}) => {
+    const url = `${API_BASE}${endpoint}`;
+    const response = await fetch(url, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...options.headers,
+      },
+      ...options,
+    });
+    return response.json();
+  };
 
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data) as WSMessage;
-        
-        switch (data.type) {
-          case 'LOGIN_SUCCESS':
-            setCurrentUser(data.payload);
-            break;
-            
-          case 'USER_LIST':
-            setUsers(data.payload);
-            break;
-            
-          case 'PRIVATE_MESSAGE': {
-            const msg = data.payload as Message;
-            const myId = currentUserRef.current?.id;
-            if (!myId) return;
+  // Polling functions
+  const pollUsers = useCallback(async () => {
+    if (!currentUser) return;
+    try {
+      const result = await apiRequest('/api/users');
+      if (result.success) {
+        setUsers(result.users.filter((u: User) => u.id !== currentUser.id));
+      }
+    } catch (error) {
+      console.error('Failed to poll users:', error);
+    }
+  }, [currentUser, API_BASE]);
 
-            const otherId = msg.senderId === myId ? msg.targetId : msg.senderId;
-            
-            setConversations(prev => ({
-              ...prev,
-              [otherId]: [...(prev[otherId] || []), msg]
-            }));
+  const pollMessages = useCallback(async () => {
+    if (!currentUser) return;
+    try {
+      const result = await apiRequest(`/api/messages?userId=${currentUser.id}&since=${lastMessageTimestamp}`);
+      if (result.success && result.messages.length > 0) {
+        // Update conversations
+        const newConversations = { ...conversations };
+        let maxTimestamp = lastMessageTimestamp;
 
-            // If I received a message (and didn't send it), open the window if not open
-            if (msg.senderId !== myId) {
-              setActiveWindows(prev => {
-                if (!prev.includes(otherId)) {
-                  return [...prev, otherId];
-                }
-                return prev;
-              });
-              
-              // Play sound?
-              if (document.hidden && Notification.permission === 'granted') {
-                 new Notification(`New message from ${users.find(u => u.id === otherId)?.username || 'Someone'}`, {
-                    body: msg.text,
-                    icon: '/vite.svg'
-                 });
-              }
-            }
-            break;
+        result.messages.forEach((msg: Message) => {
+          const otherId = msg.senderId === currentUser.id ? msg.targetId : msg.senderId;
+          if (!newConversations[otherId]) {
+            newConversations[otherId] = [];
           }
+          newConversations[otherId].push(msg);
+          maxTimestamp = Math.max(maxTimestamp, msg.timestamp);
+        });
 
-          case 'NUDGE': {
-            const { senderId } = data.payload;
-            const myId = currentUserRef.current?.id;
-            if (!myId) return;
+        setConversations(newConversations);
+        setLastMessageTimestamp(maxTimestamp);
 
-            // Nudge is basically a message but with special type
-            const nudgeMsg: Message = {
-              id: crypto.randomUUID(),
-              senderId,
-              targetId: myId,
-              text: "You received a nudge!",
-              timestamp: Date.now(),
-              type: 'nudge'
-            };
-
-            setConversations(prev => ({
-              ...prev,
-              [senderId]: [...(prev[senderId] || []), nudgeMsg]
-            }));
-
+        // Open windows for new messages
+        result.messages.forEach((msg: Message) => {
+          if (msg.senderId !== currentUser.id) {
+            const otherId = msg.senderId;
             setActiveWindows(prev => {
-              if (!prev.includes(senderId)) {
-                return [...prev, senderId];
+              if (!prev.includes(otherId)) {
+                return [...prev, otherId];
               }
               return prev;
             });
-            
-            // Shake effect is handled in ChatWindow
-            break;
+
+            // Notification
+            if (document.hidden && Notification.permission === 'granted') {
+              new Notification(`New message from ${users.find(u => u.id === otherId)?.username || 'Someone'}`, {
+                body: msg.text,
+                icon: '/vite.svg'
+              });
+            }
           }
-        }
-      } catch (e) {
-        console.error('Error parsing message:', e);
+        });
       }
-    };
+    } catch (error) {
+      console.error('Failed to poll messages:', error);
+    }
+  }, [currentUser, lastMessageTimestamp, conversations, users, API_BASE]);
+
+  // Start polling when user logs in
+  useEffect(() => {
+    if (currentUser) {
+      // Initial poll
+      pollUsers();
+      pollMessages();
+
+      // Start polling every 2 seconds
+      pollingIntervalRef.current = setInterval(() => {
+        pollUsers();
+        pollMessages();
+      }, 2000);
+    } else {
+      // Stop polling when logged out
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
+    }
 
     return () => {
-      ws.close();
-    };
-  }, []);
-
-  // Use a ref to access current user in WS callback
-  const currentUserRef = useRef<User | null>(null);
-  useEffect(() => {
-    currentUserRef.current = currentUser;
-  }, [currentUser]);
-
-  // Re-attach onmessage handler when dependencies change to avoid stale closures? 
-  // Better to just handle the logic inside the callback using refs or functional state updates that don't depend on outside state.
-  // But we need currentUser.id to know where to file the message.
-  
-  useEffect(() => {
-    if (!wsRef.current) return;
-
-    wsRef.current.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        
-        switch (data.type) {
-          case 'LOGIN_SUCCESS':
-            setCurrentUser(data.payload);
-            break;
-            
-          case 'USER_LIST':
-            setUsers(data.payload);
-            break;
-            
-          case 'PRIVATE_MESSAGE': {
-            const msg = data.payload as Message;
-            const myId = currentUserRef.current?.id;
-            if (!myId) return;
-
-            const otherId = msg.senderId === myId ? msg.targetId : msg.senderId;
-            
-            setConversations(prev => ({
-              ...prev,
-              [otherId]: [...(prev[otherId] || []), msg]
-            }));
-
-            // If I received a message (and didn't send it), open the window if not open
-            if (msg.senderId !== myId) {
-              setActiveWindows(prev => {
-                if (!prev.includes(otherId)) {
-                  return [...prev, otherId];
-                }
-                return prev;
-              });
-              
-              // Play sound?
-              if (document.hidden && Notification.permission === 'granted') {
-                 new Notification(`New message from ${users.find(u => u.id === otherId)?.username || 'Someone'}`, {
-                    body: msg.text,
-                    icon: '/vite.svg'
-                 });
-              }
-            }
-            break;
-          }
-
-          case 'NUDGE': {
-            const { senderId } = data.payload;
-            const myId = currentUserRef.current?.id;
-            if (!myId) return;
-
-            // Nudge is basically a message but with special type
-            const nudgeMsg: Message = {
-              id: crypto.randomUUID(),
-              senderId,
-              targetId: myId,
-              text: "You received a nudge!",
-              timestamp: Date.now(),
-              type: 'nudge'
-            };
-
-            setConversations(prev => ({
-              ...prev,
-              [senderId]: [...(prev[senderId] || []), nudgeMsg]
-            }));
-
-            setActiveWindows(prev => {
-              if (!prev.includes(senderId)) {
-                return [...prev, senderId];
-              }
-              return prev;
-            });
-            
-            // Shake effect is handled in ChatWindow
-            break;
-          }
-        }
-      } catch (e) {
-        console.error('Error parsing message:', e);
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
       }
     };
-  }, [users]); // Re-bind when users change to get latest user list for notifications? Actually users list might be stale in notification but that's minor.
+  }, [currentUser, pollUsers, pollMessages]);
 
-  const handleLogin = (username: string, status: UserStatus, avatar: string) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'LOGIN',
-        payload: { username, status, avatar }
-      }));
+  const handleLogin = async (username: string, status: UserStatus, avatar: string) => {
+    try {
+      const result = await apiRequest('/api/login', {
+        method: 'POST',
+        body: JSON.stringify({ username, status, avatar })
+      });
+
+      if (result.success) {
+        setCurrentUser(result.user);
+        setLastMessageTimestamp(Date.now()); // Reset message polling timestamp
+      } else {
+        console.error('Login failed:', result.error);
+      }
+    } catch (error) {
+      console.error('Login error:', error);
     }
   };
 
-  const handleLogout = () => {
-    // Refresh page to logout for now
-    window.location.reload();
+  const handleLogout = async () => {
+    if (currentUser) {
+      try {
+        await apiRequest('/api/logout', {
+          method: 'POST',
+          body: JSON.stringify({ userId: currentUser.id })
+        });
+      } catch (error) {
+        console.error('Logout error:', error);
+      }
+    }
+
+    // Clear local state
+    setCurrentUser(null);
+    setUsers([]);
+    setConversations({});
+    setActiveWindows([]);
+    setLastMessageTimestamp(0);
   };
 
   const handleOpenChat = (userId: string) => {
@@ -235,24 +169,50 @@ export default function App() {
     setActiveWindows(prev => prev.filter(id => id !== userId));
   };
 
-  const handleSendMessage = (targetId: string, text: string) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'PRIVATE_MESSAGE',
-        payload: { targetId, text, type: 'text' }
-      }));
+  const handleSendMessage = async (targetId: string, text: string) => {
+    if (!currentUser) return;
+
+    try {
+      const result = await apiRequest('/api/message', {
+        method: 'POST',
+        body: JSON.stringify({
+          senderId: currentUser.id,
+          targetId,
+          text,
+          type: 'text'
+        })
+      });
+
+      if (result.success) {
+        // Add message to local conversation
+        const message = result.message;
+        setConversations(prev => ({
+          ...prev,
+          [targetId]: [...(prev[targetId] || []), message]
+        }));
+      }
+    } catch (error) {
+      console.error('Send message error:', error);
     }
   };
 
-  const handleSendNudge = (targetId: string) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'NUDGE',
-        payload: { targetId }
-      }));
-      
-      // Add local nudge message for feedback
-      if (currentUser) {
+  const handleSendNudge = async (targetId: string) => {
+    if (!currentUser) return;
+
+    try {
+      // Send nudge as a special message
+      const result = await apiRequest('/api/message', {
+        method: 'POST',
+        body: JSON.stringify({
+          senderId: currentUser.id,
+          targetId,
+          text: "You received a nudge!",
+          type: 'nudge'
+        })
+      });
+
+      if (result.success) {
+        // Add local nudge message for feedback
         const nudgeMsg: Message = {
             id: crypto.randomUUID(),
             senderId: currentUser.id,
@@ -266,26 +226,48 @@ export default function App() {
             [targetId]: [...(prev[targetId] || []), nudgeMsg]
         }));
       }
+    } catch (error) {
+      console.error('Send nudge error:', error);
     }
   };
 
-  const handleStatusChange = (status: UserStatus) => {
-    if (wsRef.current && currentUser) {
-      setCurrentUser({ ...currentUser, status });
-      wsRef.current.send(JSON.stringify({
-        type: 'STATUS_CHANGE',
-        payload: { status }
-      }));
+  const handleStatusChange = async (status: UserStatus) => {
+    if (!currentUser) return;
+
+    try {
+      const result = await apiRequest('/api/status', {
+        method: 'POST',
+        body: JSON.stringify({
+          userId: currentUser.id,
+          status
+        })
+      });
+
+      if (result.success) {
+        setCurrentUser({ ...currentUser, status });
+      }
+    } catch (error) {
+      console.error('Status change error:', error);
     }
   };
 
-  const handlePersonalMessageChange = (msg: string) => {
-    if (wsRef.current && currentUser) {
-      setCurrentUser({ ...currentUser, personalMessage: msg });
-      wsRef.current.send(JSON.stringify({
-        type: 'STATUS_CHANGE',
-        payload: { personalMessage: msg }
-      }));
+  const handlePersonalMessageChange = async (msg: string) => {
+    if (!currentUser) return;
+
+    try {
+      const result = await apiRequest('/api/status', {
+        method: 'POST',
+        body: JSON.stringify({
+          userId: currentUser.id,
+          personalMessage: msg
+        })
+      });
+
+      if (result.success) {
+        setCurrentUser({ ...currentUser, personalMessage: msg });
+      }
+    } catch (error) {
+      console.error('Personal message change error:', error);
     }
   };
 
